@@ -13,3 +13,4 @@ __pycache__/
 output_image.jpg
 qb-throw-annotated.mp4
 throw-metrics.png
+throw-metrics-multiview.png
