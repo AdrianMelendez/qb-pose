@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -12,3 +13,5 @@ __pycache__/
 # Generated analysis output
 output_image.jpg
 qb-throw-annotated.mp4
+throw-metrics.png
+throw-metrics-multiview.png
