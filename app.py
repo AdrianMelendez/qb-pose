@@ -14,7 +14,9 @@ from analysis import (
     analyze_video,
     compare_views,
     render_annotated_video,
+    summarize_consistency,
     summarize_releases,
+    track_ball_release,
 )
 
 MAX_DURATION_S = 60  # soft cap so one upload can't tie up the app for minutes
@@ -23,9 +25,10 @@ st.set_page_config(page_title="qb-pose", page_icon="🏈", layout="centered")
 st.title("🏈 QB Throwing Motion Analysis")
 st.write(
     "Upload a video of a quarterback throwing. This detects the throwing-arm "
-    "skeleton and reports elbow angle, wrist speed, release time(s), and "
-    "hip-shoulder separation - optionally from up to three camera angles of "
-    "the same throwing session."
+    "skeleton and reports elbow angle, wrist speed, release time(s), hip-shoulder "
+    "separation, trunk lean, and stride length, plus consistency across reps and "
+    "(experimentally) real ball speed - optionally from up to three camera angles "
+    "of the same throwing session."
 )
 
 
@@ -59,9 +62,11 @@ def run_analysis(video_bytes: bytes, view: str):
 
         analysis = analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view=view)
         events = summarize_releases(analysis)
+        consistency = summarize_consistency(events)
+        ball_releases = track_ball_release(video_path, analysis, model_path=MODEL_PATH_DEFAULT)
         render_annotated_video(video_path, output_path, analysis, model_path=MODEL_PATH_DEFAULT)
         annotated_bytes = Path(output_path).read_bytes()
-        return analysis, events, annotated_bytes
+        return analysis, events, consistency, ball_releases, annotated_bytes
     finally:
         Path(video_path).unlink(missing_ok=True)
         Path(output_path).unlink(missing_ok=True)
@@ -93,7 +98,15 @@ for view, uploaded in uploads.items():
 if not results:
     st.stop()
 
-for view, (analysis, events, annotated_bytes) in results.items():
+CONSISTENCY_LABELS = {
+    "speed_mps": "Release speed (m/s)",
+    "peak_separation_deg": "Peak hip-shoulder separation (deg)",
+    "elbow_angle_release_deg": "Elbow angle @release (deg)",
+    "trunk_lean_release_deg": "Trunk lean @release (deg)",
+    "stride_length_m": "Stride length (m)",
+}
+
+for view, (analysis, events, consistency, ball_releases, annotated_bytes) in results.items():
     st.subheader(f"{view.capitalize()} view")
     st.video(annotated_bytes)
 
@@ -103,12 +116,51 @@ for view, (analysis, events, annotated_bytes) in results.items():
                 {
                     "Time (s)": f"{e['time_s']:.2f}",
                     "Release speed": f"{e['speed_mps']:.2f} m/s ({e['speed_mph']:.1f} mph)",
-                    "Peak hip-shoulder separation": f"{e['peak_separation_deg']:.1f} deg",
-                    "Separation lead": f"{e['separation_lead_ms']:.0f} ms",
+                    "Peak hip-shoulder sep.": f"{e['peak_separation_deg']:.1f} deg",
+                    "Elbow @release": f"{e['elbow_angle_release_deg']:.1f} deg",
+                    "Elbow @max cocking": f"{e['elbow_angle_max_cocking_deg']:.1f} deg",
+                    "Trunk lean": f"{e['trunk_lean_release_deg']:.1f} deg",
+                    "Stride length": f"{e['stride_length_m']:.2f} m",
                 }
                 for e in events
             ]
         )
+
+        if consistency:
+            with st.expander("Consistency across reps (mean ± std, CV%)"):
+                st.table(
+                    [
+                        {
+                            "Metric": CONSISTENCY_LABELS.get(key, key),
+                            "Mean ± std": f"{stat['mean']:.2f} ± {stat['std']:.2f}",
+                            "CV%": f"{stat['cv_pct']:.0f}%" if stat["cv_pct"] is not None else "n/a",
+                        }
+                        for key, stat in consistency.items()
+                    ]
+                )
+
+        with st.expander("Ball tracking (experimental)"):
+            st.caption(
+                "Best-effort tracking of the football itself, not the throwing hand - gives a "
+                "real speed/angle instead of the wrist-speed proxy above, but only when it can "
+                "find the ball with confidence. Works best on an uncluttered background and a "
+                "side-view angle where the ball moves laterally across the frame; a back view "
+                "often finds nothing, since the ball then moves mostly in depth."
+            )
+            if ball_releases:
+                st.table(
+                    [
+                        {
+                            "Frame": b.frame_idx,
+                            "Ball speed": f"{b.speed_mps:.2f} m/s ({b.speed_mph:.1f} mph)",
+                            "Launch angle": f"{b.angle_deg:.1f} deg",
+                            "Detections": len(b.positions),
+                        }
+                        for b in ball_releases
+                    ]
+                )
+            else:
+                st.write("No confident ball track found in this clip.")
     else:
         st.warning("No clear release event detected in this clip.")
 

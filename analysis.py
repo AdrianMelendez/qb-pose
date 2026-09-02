@@ -23,6 +23,11 @@ R_SHOULDER, L_SHOULDER = 12, 11
 R_ELBOW = 14
 R_WRIST = 16
 R_HIP, L_HIP = 24, 23
+R_ANKLE, L_ANKLE = 28, 27
+
+# Real-world long axis of an NFL football (~11in), used only to size the
+# search for a ball-like blob - not for any speed/distance calculation.
+BALL_LONG_AXIS_M = 0.28
 
 
 def has_display():
@@ -46,6 +51,16 @@ def smooth(values, window=5):
 def transverse_angle(p_from, p_to):
     """Rotation angle (degrees) of the line p_from->p_to in the horizontal (x-z) plane."""
     return np.degrees(np.arctan2(p_to.z - p_from.z, p_to.x - p_from.x))
+
+
+def angle_between(v1, v2):
+    """Angle (degrees) between two 3D vectors."""
+    cosine = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+
+def _as_vec(landmark):
+    return np.array([landmark.x, landmark.y, landmark.z])
 
 
 def find_peaks(values, min_distance, min_height):
@@ -177,6 +192,9 @@ class ThrowAnalysis:
     release_frames: list
     release_video_frames: set
     frame_indices: np.ndarray
+    elbow_angle_deg: np.ndarray
+    trunk_lean_deg: np.ndarray
+    foot_separation_m: np.ndarray
 
 
 def _make_landmarker_options(model_path):
@@ -201,6 +219,7 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
 
     frame_indices, timestamps_s = [], []
     wrist_xyz, shoulder_angles, hip_angles = [], [], []
+    elbow_angle_deg, trunk_lean_deg, foot_separation_m = [], [], []
 
     with PoseLandmarker.create_from_options(options) as landmarker:
         cap = cv2.VideoCapture(video_path)
@@ -230,6 +249,21 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
                 shoulder_angles.append(transverse_angle(world[L_SHOULDER], world[R_SHOULDER]))
                 hip_angles.append(transverse_angle(world[L_HIP], world[R_HIP]))
 
+                # Elbow (flexion) angle, in 3D world space rather than the 2D
+                # pixel angle drawn on the video, so it isn't view-dependent.
+                shoulder_v = _as_vec(world[R_SHOULDER]) - _as_vec(world[R_ELBOW])
+                wrist_v = _as_vec(world[R_WRIST]) - _as_vec(world[R_ELBOW])
+                elbow_angle_deg.append(angle_between(shoulder_v, wrist_v))
+
+                # Trunk lean: angle of the hip-to-shoulder line from vertical.
+                mid_hip = (_as_vec(world[L_HIP]) + _as_vec(world[R_HIP])) / 2
+                mid_shoulder = (_as_vec(world[L_SHOULDER]) + _as_vec(world[R_SHOULDER])) / 2
+                trunk_lean_deg.append(angle_between(mid_shoulder - mid_hip, np.array([0.0, -1.0, 0.0])))
+
+                # Foot separation: distance between the ankles, a proxy for
+                # stride length that peaks around front-foot plant.
+                foot_separation_m.append(float(np.linalg.norm(_as_vec(world[L_ANKLE]) - _as_vec(world[R_ANKLE]))))
+
             frame_count += 1
 
         cap.release()
@@ -245,6 +279,9 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
     wrist_xyz = np.array(wrist_xyz).reshape(-1, 3)
     shoulder_angles = smooth(shoulder_angles)
     hip_angles = smooth(hip_angles)
+    elbow_angle_deg = smooth(elbow_angle_deg)
+    trunk_lean_deg = smooth(trunk_lean_deg)
+    foot_separation_m = smooth(foot_separation_m)
 
     # Hip-shoulder separation: rotational difference between the shoulder and
     # hip lines in the transverse plane - a proxy for kinematic-sequence
@@ -277,20 +314,45 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
         release_frames=release_frames,
         release_video_frames=release_video_frames,
         frame_indices=frame_indices,
+        elbow_angle_deg=elbow_angle_deg,
+        trunk_lean_deg=trunk_lean_deg,
+        foot_separation_m=foot_separation_m,
     )
 
 
 def summarize_releases(analysis: ThrowAnalysis):
-    """Per-release-event dicts: time, throwing-hand speed, peak separation."""
+    """Per-release-event dicts: time, throwing-hand speed, peak separation,
+    elbow angle (at release and at max cocking), trunk lean, and stride
+    length (peak foot separation) around release.
+
+    "Max cocking" is approximated as the local minimum in wrist speed just
+    before release - the brief pause at the top of the throwing motion
+    before the arm accelerates forward - since a true external-rotation
+    angle needs a forearm axis MediaPipe's body landmarks don't provide.
+    """
     events = []
+    lookback_frames = max(1, int(round(1.0 * analysis.fps)))
+
     for idx in analysis.release_frames:
         t = analysis.speed_timestamps[idx]
         speed_mps = analysis.wrist_speed[idx]
+        release_ts_i = int(np.argmin(np.abs(analysis.timestamps_s - t)))
 
         window_mask = (analysis.timestamps_s >= t - 1.0) & (analysis.timestamps_s <= t)
         sep_window = analysis.separation_deg[window_mask]
         sep_ts_window = analysis.timestamps_s[window_mask]
         peak_sep_i = int(np.argmax(sep_window))
+
+        stride_window = analysis.foot_separation_m[window_mask]
+
+        lo = max(0, idx - lookback_frames)
+        cocking_window = analysis.wrist_speed[lo:idx]
+        if len(cocking_window) > 0:
+            cocking_t = analysis.speed_timestamps[lo + int(np.argmin(cocking_window))]
+            cocking_ts_i = int(np.argmin(np.abs(analysis.timestamps_s - cocking_t)))
+            elbow_angle_max_cocking_deg = float(analysis.elbow_angle_deg[cocking_ts_i])
+        else:
+            elbow_angle_max_cocking_deg = None
 
         events.append(
             {
@@ -299,9 +361,43 @@ def summarize_releases(analysis: ThrowAnalysis):
                 "speed_mph": speed_mps * 2.237,
                 "peak_separation_deg": sep_window[peak_sep_i],
                 "separation_lead_ms": (t - sep_ts_window[peak_sep_i]) * 1000,
+                "elbow_angle_release_deg": float(analysis.elbow_angle_deg[release_ts_i]),
+                "elbow_angle_max_cocking_deg": elbow_angle_max_cocking_deg,
+                "trunk_lean_release_deg": float(analysis.trunk_lean_deg[release_ts_i]),
+                "stride_length_m": float(stride_window.max()) if len(stride_window) else None,
             }
         )
     return events
+
+
+def summarize_consistency(events):
+    """Mean/stddev/coefficient-of-variation across all release events in a
+    clip - useful for seeing how repeatable a QB's mechanics are across reps,
+    not just the numbers for any one throw. Returns None with fewer than 2
+    events (nothing to compare)."""
+    if len(events) < 2:
+        return None
+
+    keys = [
+        "speed_mps",
+        "peak_separation_deg",
+        "elbow_angle_release_deg",
+        "trunk_lean_release_deg",
+        "stride_length_m",
+    ]
+    summary = {}
+    for key in keys:
+        values = [e[key] for e in events if e.get(key) is not None]
+        if len(values) < 2:
+            continue
+        mean = float(np.mean(values))
+        std = float(np.std(values))
+        summary[key] = {
+            "mean": mean,
+            "std": std,
+            "cv_pct": (std / mean * 100) if mean else None,
+        }
+    return summary
 
 
 def render_annotated_video(
@@ -400,3 +496,205 @@ def compare_views(results: "dict[str, ThrowAnalysis]"):
     fig.suptitle("Wrist speed & hip-shoulder separation" + (" (multi-view)" if len(results) > 1 else ""))
     fig.tight_layout()
     return fig
+
+
+# --- Ball tracking (best-effort) --------------------------------------------
+#
+# Everything above measures the throwing HAND, not the ball - wrist speed is
+# a proxy for release speed, not the real thing. This section tries to track
+# the actual football for a short window after each detected release, to get
+# a real speed and launch angle. It's a lightweight classical-CV detector
+# (frame differencing + contour filtering in a small region ahead of the
+# hand), not a trained object detector - it works best against a relatively
+# uncluttered background and can simply fail to find the ball, especially in
+# a busy scene. A release event with no confident detection streak is left
+# out of the result rather than reported with made-up numbers.
+
+
+@dataclass
+class BallRelease:
+    frame_idx: int
+    speed_mps: float
+    speed_mph: float
+    angle_deg: float  # from horizontal, image plane; positive = upward
+    positions: list  # [(frame_idx, x_px, y_px), ...] detections used for the fit
+
+
+def _segment_scale_m_per_px(image_lm, world_lm, frame_width, frame_height, idx_a, idx_b):
+    """meters-per-pixel implied by one body segment: its real length (from
+    the metric-scale world landmarks) divided by its length in this frame's
+    pixel space (from the normalized image landmarks)."""
+    img_a = np.array([image_lm[idx_a].x * frame_width, image_lm[idx_a].y * frame_height])
+    img_b = np.array([image_lm[idx_b].x * frame_width, image_lm[idx_b].y * frame_height])
+    px_dist = np.linalg.norm(img_a - img_b)
+    if px_dist < 5:  # too foreshortened by this camera angle to be reliable
+        return None
+    m_dist = np.linalg.norm(_as_vec(world_lm[idx_a]) - _as_vec(world_lm[idx_b]))
+    return float(m_dist / px_dist)
+
+
+def _frame_scale_m_per_px(image_lm, world_lm, frame_width, frame_height):
+    """meters-per-pixel for this frame: median over a few body segments with
+    known real length, so any single foreshortened segment doesn't skew it."""
+    candidates = []
+    for idx_a, idx_b in ((L_SHOULDER, R_SHOULDER), (L_HIP, R_HIP), (R_SHOULDER, R_HIP)):
+        scale = _segment_scale_m_per_px(image_lm, world_lm, frame_width, frame_height, idx_a, idx_b)
+        if scale is not None:
+            candidates.append(scale)
+    return float(np.median(candidates)) if candidates else None
+
+
+def _detect_ball_in_roi(prev_gray, gray, roi):
+    """Find the most ball-like moving blob inside roi=(x0,y0,x1,y1) via frame
+    differencing. Returns a pixel (x, y) centroid, or None."""
+    x0, y0, x1, y1 = roi
+    prev_crop = prev_gray[y0:y1, x0:x1]
+    crop = gray[y0:y1, x0:x1]
+    if prev_crop.size == 0 or crop.size == 0:
+        return None
+
+    diff = cv2.absdiff(prev_crop, crop)
+    _, mask = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 15:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        aspect = bw / bh if bh else 0
+        if not (0.3 <= aspect <= 3.0):  # reject long thin motion smears (limbs, edges)
+            continue
+        if area > best_area:
+            best_area = area
+            best = (x0 + bx + bw / 2, y0 + by + bh / 2)
+    return best
+
+
+def track_ball_release(video_path, analysis: ThrowAnalysis, model_path=MODEL_PATH_DEFAULT, search_frames=10, roi_radius_px=140):
+    """Best-effort tracking of the football for a short window after each
+    detected release. Returns a list of BallRelease, one per release event
+    where the ball was confidently found (may be shorter than
+    analysis.release_frames, or empty).
+    """
+    PoseLandmarker = mp.tasks.vision.PoseLandmarker
+    BaseOptions = mp.tasks.BaseOptions
+    PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+    image_options = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.IMAGE,
+    )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open this file as a video.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+
+    releases = []
+    with PoseLandmarker.create_from_options(image_options) as landmarker:
+        for release_frame in sorted(analysis.release_video_frames):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, release_frame)
+            ret, ref_frame = cap.read()
+            if not ret:
+                continue
+            h, w = ref_frame.shape[:2]
+
+            rgb = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect(mp_image)
+            if not result.pose_landmarks or not result.pose_world_landmarks:
+                continue
+            image_lm = result.pose_landmarks[0]
+            world_lm = result.pose_world_landmarks[0]
+
+            scale = _frame_scale_m_per_px(image_lm, world_lm, w, h)
+            if scale is None:
+                continue
+
+            wrist_px = np.array([image_lm[R_WRIST].x * w, image_lm[R_WRIST].y * h])
+            elbow_px = np.array([image_lm[R_ELBOW].x * w, image_lm[R_ELBOW].y * h])
+            throw_dir = wrist_px - elbow_px
+            norm = np.linalg.norm(throw_dir)
+            throw_dir = throw_dir / norm if norm > 1e-6 else np.array([1.0, 0.0])
+
+            # Re-seek to just before release so the first diffed pair can
+            # catch the ball as it's leaving the hand.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, release_frame - 1))
+            ret, prev_frame = cap.read()
+            if not ret:
+                continue
+            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+
+            detections = []
+            search_center = wrist_px.copy()
+            for offset in range(search_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                search_center = search_center + throw_dir * roi_radius_px * 0.5
+                x0 = int(max(0, search_center[0] - roi_radius_px))
+                y0 = int(max(0, search_center[1] - roi_radius_px))
+                x1 = int(min(w, search_center[0] + roi_radius_px))
+                y1 = int(min(h, search_center[1] + roi_radius_px))
+
+                hit = _detect_ball_in_roi(prev_gray, gray, (x0, y0, x1, y1))
+                if hit is not None:
+                    detections.append((release_frame + 1 + offset, hit[0], hit[1]))
+                    search_center = np.array(hit)
+
+                prev_gray = gray
+
+            if len(detections) < 3:
+                continue
+
+            # A frame-differencing detector in a busy scene (other players,
+            # camera shake, grass texture) will happily "find" something in
+            # the ROI most frames - it just won't be the ball consistently.
+            # Reject tracks that aren't plausibly one real object in real
+            # flight: real net motion, roughly toward where the QB threw,
+            # and frame-to-frame speed/direction that doesn't zigzag.
+            positions_px = np.array([(x, y) for _, x, y in detections], dtype=float)
+            net_disp = positions_px[-1] - positions_px[0]
+            if np.linalg.norm(net_disp) < roi_radius_px * 0.5 or np.dot(net_disp, throw_dir) <= 0:
+                continue
+
+            step_vecs = np.diff(positions_px, axis=0)
+            step_dt = np.diff([f for f, _, _ in detections]) / fps
+            step_speeds_px = np.linalg.norm(step_vecs, axis=1) / step_dt
+            if step_speeds_px.mean() == 0 or step_speeds_px.std() / step_speeds_px.mean() > 0.75:
+                continue  # too erratic frame-to-frame to trust as one tracked object
+
+            step_dirs = step_vecs / np.linalg.norm(step_vecs, axis=1, keepdims=True)
+            cos_sims = np.sum(step_dirs[:-1] * step_dirs[1:], axis=1)
+            if len(cos_sims) > 0 and cos_sims.mean() < 0.2:
+                continue  # consecutive steps reverse direction too much to be real flight
+
+            speeds, angles = [], []
+            for (f0, x0, y0), (f1, x1, y1) in zip(detections, detections[1:]):
+                dt = (f1 - f0) / fps
+                if dt <= 0:
+                    continue
+                dx_m, dy_m = (x1 - x0) * scale, -(y1 - y0) * scale  # image y grows downward
+                speeds.append(np.hypot(dx_m, dy_m) / dt)
+                angles.append(np.degrees(np.arctan2(dy_m, dx_m)))
+
+            if not speeds:
+                continue
+
+            releases.append(
+                BallRelease(
+                    frame_idx=release_frame,
+                    speed_mps=float(np.median(speeds)),
+                    speed_mph=float(np.median(speeds)) * 2.237,
+                    angle_deg=float(np.median(angles)),
+                    positions=detections,
+                )
+            )
+
+    cap.release()
+    return releases

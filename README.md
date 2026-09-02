@@ -4,10 +4,13 @@ Quarterback throwing-motion biomechanics analysis using [MediaPipe Pose Landmark
 
 It detects a 33-point body skeleton on an image or video of a QB throwing and computes:
 
-- **Elbow angle** at the throwing arm, drawn live on every frame
+- **Elbow angle** at the throwing arm, drawn live on every frame, plus specifically at release and at "max cocking" (approximated as the pause in wrist speed right before the forward swing)
 - **Wrist speed** — throwing-hand speed over time (a proxy for release speed, not ball speed)
 - **Release time(s)** — detected as the peak(s) in wrist speed; a clip can contain several throwing reps
 - **Hip-shoulder separation** — rotational lead of the hips over the shoulders, a proxy for throwing efficiency
+- **Trunk lean** and **stride length** (peak foot separation) around release
+- **Consistency across reps** — mean/stddev/CV% of the above across every detected release in a clip, not just one throw's numbers
+- **Ball tracking** (experimental) — best-effort tracking of the actual football for a real speed/launch angle instead of the wrist-speed proxy; see [below](#ball-tracking-experimental) for when it does and doesn't work
 
 The reusable analysis code lives in [`analysis.py`](analysis.py); `demo.ipynb` and the [web app](#web-app) are both thin front-ends on top of it.
 
@@ -50,10 +53,16 @@ This is a single-process, synchronous demo app: one upload is processed per requ
 
 This isn't true synchronized 3D triangulation — that needs calibrated, timestamp-aligned cameras filming the same instant — but it does let you sanity-check whether independent single-view measurements roughly agree, since a 2D-plane joint angle or speed estimate can be distorted by which way the camera happens to be facing.
 
+## Ball tracking (experimental)
+
+`track_ball_release()` tries to track the football itself for a short window after each detected release, instead of only reporting the throwing-hand speed. It's a lightweight classical-CV detector (frame differencing in a small region ahead of the hand), not a trained object detector, self-calibrated to real-world units from the thrower's own body (meters-per-pixel derived from a body segment's known real length vs. its pixel length in that frame — no physical reference object needed).
+
+It only reports a result when it finds a track that's internally consistent (real net motion, roughly toward where the QB threw, without erratic frame-to-frame jumps) — on the bundled `qb-throw.mp4` it currently finds nothing, and that's the correct, honest behavior rather than a bug: this is a back-view clip with other people in the background, and the ball is moving mostly *into* the depth of the scene rather than laterally across the frame, which is close to a worst case for a 2D pixel-based tracker. A side-view clip, where the ball crosses the frame laterally, is expected to work much better — this is one more reason the [multi-view](#multi-view-side--front) feature above is worth using.
+
 ## Testing
 
 ```
 uv run pytest
 ```
 
-Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`) plus an integration test that runs the full detection pipeline against the bundled `qb-throw.mp4` and asserts it finds real release events.
+Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`, `angle_between`, the ball detector on synthetic frames) plus integration tests that run the full pipeline against the bundled `qb-throw.mp4` and check it finds real release events, per-rep angles, and cross-rep consistency stats.

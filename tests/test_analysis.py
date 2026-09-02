@@ -1,7 +1,8 @@
+import cv2
 import numpy as np
 import pytest
 
-from analysis import find_peaks, smooth, transverse_angle
+from analysis import _detect_ball_in_roi, angle_between, find_peaks, smooth, transverse_angle
 
 
 def test_smooth_preserves_length():
@@ -59,3 +60,32 @@ def test_find_peaks_respects_min_height():
     values = np.array([0, 1, 0, 1, 0], dtype=float)
     peaks = find_peaks(values, min_distance=1, min_height=5)
     assert peaks == []
+
+
+@pytest.mark.parametrize(
+    "v1, v2, expected_deg",
+    [
+        ((1, 0, 0), (1, 0, 0), 0.0),
+        ((1, 0, 0), (0, 1, 0), 90.0),
+        ((1, 0, 0), (-1, 0, 0), 180.0),
+    ],
+)
+def test_angle_between(v1, v2, expected_deg):
+    assert angle_between(np.array(v1), np.array(v2)) == pytest.approx(expected_deg)
+
+
+def test_detect_ball_in_roi_tracks_a_moving_blob():
+    frame1 = np.zeros((200, 200), dtype=np.uint8)
+    frame2 = np.zeros((200, 200), dtype=np.uint8)
+    cv2.circle(frame1, (50, 50), 8, 255, -1)
+    cv2.circle(frame2, (70, 60), 8, 255, -1)
+
+    hit = _detect_ball_in_roi(frame1, frame2, (0, 0, 200, 200))
+    assert hit is not None
+    assert hit == pytest.approx((70.5, 60.5), abs=2)
+
+
+def test_detect_ball_in_roi_no_motion_returns_none():
+    frame = np.zeros((200, 200), dtype=np.uint8)
+    cv2.circle(frame, (50, 50), 8, 255, -1)
+    assert _detect_ball_in_roi(frame, frame, (0, 0, 200, 200)) is None
