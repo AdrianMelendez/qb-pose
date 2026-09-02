@@ -5,8 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "imageio-ffmpeg>=0.6.0",
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "mediapipe>=0.10.32",
     "opencv-contrib-python>=4.13.0.90",
+    "streamlit>=1.63.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

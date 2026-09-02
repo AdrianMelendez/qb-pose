@@ -5,10 +5,12 @@ Kept out of the notebook so the same logic can be driven from anywhere else
 """
 
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 
 import cv2
+import imageio_ffmpeg
 import mediapipe as mp
 import numpy as np
 
@@ -141,6 +143,27 @@ def draw_metrics_hud(canvas, wrist_speed_mps=None, separation_deg=None, is_relea
     return canvas
 
 
+def transcode_to_h264(path):
+    """Re-encode a video in place to H.264/yuv420p.
+
+    cv2.VideoWriter's 'mp4v' (MPEG-4 Part 2) output plays in players like VLC
+    but not in browsers, which is what any web front-end needs. Uses the
+    static ffmpeg binary bundled by imageio-ffmpeg so this doesn't depend on
+    ffmpeg being separately installed on the host.
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    tmp_path = path + ".h264.mp4"
+    subprocess.run(
+        [
+            ffmpeg_exe, "-y", "-i", path,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-loglevel", "error", tmp_path,
+        ],
+        check=True,
+    )
+    os.replace(tmp_path, path)
+
+
 @dataclass
 class ThrowAnalysis:
     view: str
@@ -181,6 +204,9 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
 
     with PoseLandmarker.create_from_options(options) as landmarker:
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError("Could not open this file as a video.")
+
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -208,9 +234,15 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
 
         cap.release()
 
+    if len(timestamps_s) < 2:
+        raise ValueError(
+            "No pose could be detected in enough of this video to analyze it - "
+            "make sure a person is clearly visible for most of the clip."
+        )
+
     frame_indices = np.array(frame_indices)
     timestamps_s = np.array(timestamps_s)
-    wrist_xyz = np.array(wrist_xyz)
+    wrist_xyz = np.array(wrist_xyz).reshape(-1, 3)
     shoulder_angles = smooth(shoulder_angles)
     hip_angles = smooth(hip_angles)
 
@@ -272,11 +304,15 @@ def summarize_releases(analysis: ThrowAnalysis):
     return events
 
 
-def render_annotated_video(video_path, output_path, analysis: ThrowAnalysis, model_path=MODEL_PATH_DEFAULT, flash_frames=6):
+def render_annotated_video(
+    video_path, output_path, analysis: ThrowAnalysis, model_path=MODEL_PATH_DEFAULT, flash_frames=6, web_safe=True
+):
     """Write an annotated video: skeleton + elbow angle + wrist speed +
     hip-shoulder separation + a brief RELEASE flash at each detected event.
 
-    Also opens a live preview window if a display is available.
+    Also opens a live preview window if a display is available. When
+    web_safe (the default), the output is transcoded to H.264 afterwards so
+    it plays inline in browsers - cv2.VideoWriter's own 'mp4v' output often won't.
     """
     PoseLandmarker = mp.tasks.vision.PoseLandmarker
     options = _make_landmarker_options(model_path)
@@ -325,6 +361,9 @@ def render_annotated_video(video_path, output_path, analysis: ThrowAnalysis, mod
         writer.release()
         if show_live:
             cv2.destroyAllWindows()
+
+    if web_safe:
+        transcode_to_h264(output_path)
 
     return frame_count
 
