@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Windows download metadata (alternate data stream sidecar files)
+*:Zone.Identifier
+
+# Generated analysis output
+output_image.jpg
+qb-throw-annotated.mp4
