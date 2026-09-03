@@ -16,6 +16,13 @@ import numpy as np
 
 MODEL_PATH_DEFAULT = "./pose_landmarker.task"
 
+# Downscale wider frames to this before running pose detection or writing
+# output - MediaPipe resizes internally anyway, so accuracy is largely
+# unaffected, but reading/inferring/encoding a 4K or 1080p phone video at
+# full resolution is dramatically slower (and was the likely cause of a
+# processing run that looked "stuck" rather than just slow).
+MAX_FRAME_WIDTH = 960
+
 # Throwing-arm/torso landmark indices. MediaPipe assigns these by the
 # subject's own anatomical left/right (not by camera position), so the same
 # indices are correct regardless of which side of the subject the camera is on.
@@ -24,6 +31,11 @@ R_ELBOW = 14
 R_WRIST = 16
 R_HIP, L_HIP = 24, 23
 R_ANKLE, L_ANKLE = 28, 27
+
+# Face landmark indices (BlazePose topology), used only for blur_faces().
+NOSE = 0
+L_EYE, R_EYE = 2, 5
+L_EAR, R_EAR = 7, 8
 
 # Real-world long axis of an NFL football (~11in), used only to size the
 # search for a ball-like blob - not for any speed/distance calculation.
@@ -61,6 +73,27 @@ def angle_between(v1, v2):
 
 def _as_vec(landmark):
     return np.array([landmark.x, landmark.y, landmark.z])
+
+
+def _target_size(width, height, max_width=MAX_FRAME_WIDTH):
+    """Downscaled (width, height) preserving aspect ratio, or the size
+    unchanged if it's already at or under max_width."""
+    if width <= max_width or width <= 0:
+        return width, height
+    scale = max_width / width
+    return max_width, max(1, int(round(height * scale)))
+
+
+def _read_resized(cap, target_width, target_height):
+    """cap.read(), resized to (target_width, target_height) if that differs
+    from the frame's actual size."""
+    ret, frame = cap.read()
+    if not ret:
+        return ret, frame
+    h, w = frame.shape[:2]
+    if (w, h) != (target_width, target_height):
+        frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    return ret, frame
 
 
 def find_peaks(values, min_distance, min_height):
@@ -144,6 +177,62 @@ def visualize_qb_analysis(frame, detection_result):
     return canvas
 
 
+_face_cascade = None
+
+
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _face_cascade = cv2.CascadeClassifier(path)
+    return _face_cascade
+
+
+def blur_faces(canvas, pose_landmarks, margin=1.8):
+    """Blur the head region in place, e.g. before saving a clip as a public example.
+
+    Uses the face landmarks (nose/eyes/ears) already produced by pose
+    detection as the primary signal - unlike a generic face detector, these
+    track the head reliably even turned to the side or partly away from
+    the camera, since they're the same landmarks the rest of the analysis
+    already depends on. A Haar-cascade face detector also runs as a second,
+    independent pass, and blurs anything it finds too: this exists to
+    protect a real person's identity, so a frame the landmark heuristic
+    happens to miss is not an acceptable failure mode.
+
+    Not applied automatically anywhere in the pipeline - call it explicitly
+    (e.g. when producing a clip meant to be shared publicly).
+    """
+    h, w = canvas.shape[:2]
+    boxes = []
+
+    if pose_landmarks:
+        pts = [pose_landmarks[i] for i in (NOSE, L_EYE, R_EYE, L_EAR, R_EAR) if pose_landmarks[i].visibility > 0.3]
+        if pts:
+            cx = sum(lm.x for lm in pts) / len(pts) * w
+            cy = sum(lm.y for lm in pts) / len(pts) * h
+            ear_l, ear_r = pose_landmarks[L_EAR], pose_landmarks[R_EAR]
+            ear_dist = np.hypot((ear_l.x - ear_r.x) * w, (ear_l.y - ear_r.y) * h)
+            radius = max(ear_dist, w * 0.05) * margin
+            boxes.append((cx - radius, cy - radius, cx + radius, cy + radius))
+
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    for fx, fy, fw, fh in _get_face_cascade().detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30)):
+        pad = fw * 0.4
+        boxes.append((fx - pad, fy - pad, fx + fw + pad, fy + fh + pad))
+
+    for x0, y0, x1, y1 in boxes:
+        x0, y0 = int(max(0, x0)), int(max(0, y0))
+        x1, y1 = int(min(w, x1)), int(min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        roi = canvas[y0:y1, x0:x1]
+        k = max(15, (min(roi.shape[:2]) // 2) | 1)
+        canvas[y0:y1, x0:x1] = cv2.GaussianBlur(roi, (k, k), 0)
+
+    return canvas
+
+
 def draw_metrics_hud(canvas, wrist_speed_mps=None, separation_deg=None, is_release=False):
     """Overlay wrist speed / hip-shoulder separation / a release flash in the corner."""
     y = 30
@@ -207,12 +296,17 @@ def _make_landmarker_options(model_path):
     )
 
 
-def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
+def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back", on_progress=None):
     """Run pose detection over a video and compute wrist speed, release
     events, and hip-shoulder separation from the throwing arm/torso.
 
     Uses MediaPipe's metric-scale pose_world_landmarks (not the normalized
     image-space ones) so the result isn't distorted by camera perspective.
+
+    on_progress(frame_count, total_frames), if given, is called after every
+    frame - total_frames may be None if the container doesn't report a
+    reliable frame count. Useful for a caller (e.g. a web UI) to show real
+    progress on a long clip instead of a silent wait.
     """
     PoseLandmarker = mp.tasks.vision.PoseLandmarker
     options = _make_landmarker_options(model_path)
@@ -227,12 +321,14 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
             raise ValueError("Could not open this file as a video.")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_width, frame_height = _target_size(
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
 
         frame_count = 0
         while cap.isOpened():
-            ret, frame = cap.read()
+            ret, frame = _read_resized(cap, frame_width, frame_height)
             if not ret:
                 break
 
@@ -265,6 +361,8 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
                 foot_separation_m.append(float(np.linalg.norm(_as_vec(world[L_ANKLE]) - _as_vec(world[R_ANKLE]))))
 
             frame_count += 1
+            if on_progress:
+                on_progress(frame_count, total_frames)
 
         cap.release()
 
@@ -320,15 +418,62 @@ def analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view="back"):
     )
 
 
+def _find_movement_onset(wrist_speed, release_idx, fps, idle_multiplier=1.5, min_idle_s=0.15, max_lookback_s=3.0):
+    """Index into wrist_speed where the throwing motion began: the end of
+    the last sustained "idle" stretch before this release, within a bounded
+    lookback window.
+
+    "Idle" means wrist speed close to the *clip's own* resting baseline (the
+    whole-clip 10th percentile), not a threshold relative to this throw's
+    own peak speed. Scaling by peak speed sounds adaptive, but a throwing
+    motion has its own brief pause mid-windup (the "max cocking" pause,
+    still well above true rest) - for a hard throw, even a small fraction
+    of its peak speed sits above that pause, so a peak-relative threshold
+    ends up finding the cocking pause instead of the true start of the
+    motion (empirically, ~100ms "time to release" instead of a plausible
+    ~1-2s, on the bundled sample clip).
+    """
+    max_lookback_frames = int(round(max_lookback_s * fps))
+    lo = max(0, release_idx - max_lookback_frames)
+    window = wrist_speed[lo:release_idx]
+    if len(window) == 0:
+        return lo
+
+    baseline = float(np.percentile(wrist_speed, 10))
+    threshold = baseline * idle_multiplier
+    min_idle_frames = max(1, int(round(min_idle_s * fps)))
+
+    below = window <= threshold
+    onset_offset = 0  # fallback: no qualifying idle stretch in the window - motion was already underway
+    i = 0
+    while i < len(below):
+        if below[i]:
+            j = i
+            while j < len(below) and below[j]:
+                j += 1
+            if (j - i) >= min_idle_frames:
+                onset_offset = j  # keep the *last* qualifying idle->moving transition found
+            i = j
+        else:
+            i += 1
+    return lo + onset_offset
+
+
 def summarize_releases(analysis: ThrowAnalysis):
     """Per-release-event dicts: time, throwing-hand speed, peak separation,
-    elbow angle (at release and at max cocking), trunk lean, and stride
-    length (peak foot separation) around release.
+    elbow angle (at release and at max cocking), trunk lean, stride length
+    (peak foot separation) around release, and time-to-release.
 
     "Max cocking" is approximated as the local minimum in wrist speed just
     before release - the brief pause at the top of the throwing motion
     before the arm accelerates forward - since a true external-rotation
     angle needs a forearm axis MediaPipe's body landmarks don't provide.
+
+    "Time to release" is the duration from when the throwing motion first
+    starts (the end of the last sustained stretch of near-idle wrist speed
+    before release - see _find_movement_onset) to release itself, similar
+    in spirit to "time to throw" in broadcast/analytics football stats,
+    except measured from the body starting to move rather than from a snap.
     """
     events = []
     lookback_frames = max(1, int(round(1.0 * analysis.fps)))
@@ -354,6 +499,9 @@ def summarize_releases(analysis: ThrowAnalysis):
         else:
             elbow_angle_max_cocking_deg = None
 
+        onset_idx = _find_movement_onset(analysis.wrist_speed, idx, analysis.fps)
+        onset_t = float(analysis.speed_timestamps[onset_idx])
+
         events.append(
             {
                 "time_s": t,
@@ -365,6 +513,8 @@ def summarize_releases(analysis: ThrowAnalysis):
                 "elbow_angle_max_cocking_deg": elbow_angle_max_cocking_deg,
                 "trunk_lean_release_deg": float(analysis.trunk_lean_deg[release_ts_i]),
                 "stride_length_m": float(stride_window.max()) if len(stride_window) else None,
+                "movement_onset_time_s": onset_t,
+                "time_to_release_ms": (t - onset_t) * 1000,
             }
         )
     return events
@@ -384,6 +534,7 @@ def summarize_consistency(events):
         "elbow_angle_release_deg",
         "trunk_lean_release_deg",
         "stride_length_m",
+        "time_to_release_ms",
     ]
     summary = {}
     for key in keys:
@@ -401,7 +552,14 @@ def summarize_consistency(events):
 
 
 def render_annotated_video(
-    video_path, output_path, analysis: ThrowAnalysis, model_path=MODEL_PATH_DEFAULT, flash_frames=6, web_safe=True
+    video_path,
+    output_path,
+    analysis: ThrowAnalysis,
+    model_path=MODEL_PATH_DEFAULT,
+    flash_frames=6,
+    web_safe=True,
+    on_progress=None,
+    blur_faces_in_output=False,
 ):
     """Write an annotated video: skeleton + elbow angle + wrist speed +
     hip-shoulder separation + a brief RELEASE flash at each detected event.
@@ -409,6 +567,13 @@ def render_annotated_video(
     Also opens a live preview window if a display is available. When
     web_safe (the default), the output is transcoded to H.264 afterwards so
     it plays inline in browsers - cv2.VideoWriter's own 'mp4v' output often won't.
+
+    on_progress(frame_count, total_frames) is called after every frame, same
+    as analyze_video - total_frames may be None if unreliable, and does not
+    include the (fast) transcode step.
+
+    blur_faces_in_output applies blur_faces() to every frame - use it when
+    producing a clip meant to be shared publicly.
     """
     PoseLandmarker = mp.tasks.vision.PoseLandmarker
     options = _make_landmarker_options(model_path)
@@ -422,13 +587,14 @@ def render_annotated_video(
     with PoseLandmarker.create_from_options(options) as landmarker:
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
         writer = cv2.VideoWriter(
             output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (analysis.frame_width, analysis.frame_height)
         )
 
         frame_count = 0
         while cap.isOpened():
-            ret, frame = cap.read()
+            ret, frame = _read_resized(cap, analysis.frame_width, analysis.frame_height)
             if not ret:
                 break
 
@@ -438,6 +604,8 @@ def render_annotated_video(
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             annotated = visualize_qb_analysis(frame, result)
+            if blur_faces_in_output:
+                blur_faces(annotated, result.pose_landmarks[0] if result.pose_landmarks else None)
             draw_metrics_hud(
                 annotated,
                 wrist_speed_mps=speed_by_frame.get(frame_count),
@@ -452,6 +620,8 @@ def render_annotated_video(
                     break
 
             frame_count += 1
+            if on_progress:
+                on_progress(frame_count, total_frames)
 
         cap.release()
         writer.release()
@@ -593,14 +763,19 @@ def track_ball_release(video_path, analysis: ThrowAnalysis, model_path=MODEL_PAT
         raise ValueError("Could not open this file as a video.")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
+    w, h = analysis.frame_width, analysis.frame_height
+
     releases = []
     with PoseLandmarker.create_from_options(image_options) as landmarker:
         for release_frame in sorted(analysis.release_video_frames):
+            # One seek per release event, not two: the search loop below diffs
+            # forward from this frame instead of re-seeking to release_frame-1
+            # (a second seek is needless overhead, and can be genuinely slow on
+            # long-GOP video where a seek means decoding from the prior keyframe).
             cap.set(cv2.CAP_PROP_POS_FRAMES, release_frame)
-            ret, ref_frame = cap.read()
+            ret, ref_frame = _read_resized(cap, w, h)
             if not ret:
                 continue
-            h, w = ref_frame.shape[:2]
 
             rgb = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -620,18 +795,12 @@ def track_ball_release(video_path, analysis: ThrowAnalysis, model_path=MODEL_PAT
             norm = np.linalg.norm(throw_dir)
             throw_dir = throw_dir / norm if norm > 1e-6 else np.array([1.0, 0.0])
 
-            # Re-seek to just before release so the first diffed pair can
-            # catch the ball as it's leaving the hand.
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, release_frame - 1))
-            ret, prev_frame = cap.read()
-            if not ret:
-                continue
-            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+            prev_gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
 
             detections = []
             search_center = wrist_px.copy()
             for offset in range(search_frames):
-                ret, frame = cap.read()
+                ret, frame = _read_resized(cap, w, h)
                 if not ret:
                     break
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

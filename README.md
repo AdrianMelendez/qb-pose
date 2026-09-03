@@ -7,6 +7,7 @@ It detects a 33-point body skeleton on an image or video of a QB throwing and co
 - **Elbow angle** at the throwing arm, drawn live on every frame, plus specifically at release and at "max cocking" (approximated as the pause in wrist speed right before the forward swing)
 - **Wrist speed** — throwing-hand speed over time (a proxy for release speed, not ball speed)
 - **Release time(s)** — detected as the peak(s) in wrist speed; a clip can contain several throwing reps
+- **Time to release** — duration from when the throwing motion first starts (the end of the last sustained near-idle stretch in wrist speed before release) to release itself
 - **Hip-shoulder separation** — rotational lead of the hips over the shoulders, a proxy for throwing efficiency
 - **Trunk lean** and **stride length** (peak foot separation) around release
 - **Consistency across reps** — mean/stddev/CV% of the above across every detected release in a clip, not just one throw's numbers
@@ -47,11 +48,37 @@ The output video is transcoded to H.264 (`analysis.transcode_to_h264`, via the s
 
 This is a single-process, synchronous demo app: one upload is processed per request, in-process. It's fine for local/personal use as-is; a public multi-user deployment would want the analysis to run as a background job (e.g. a task queue) instead of blocking the web request, so one slow upload can't stall everyone else's.
 
+### Deploying it publicly (Streamlit Community Cloud)
+
+The fastest way to get a shareable URL is [Streamlit Community Cloud](https://share.streamlit.io) (free): sign in with GitHub, "Create app" → "Yup, I have an app", point it at this repo/branch and `app.py`, and deploy — it defaults to Python 3.12, matching this project, no extra config needed.
+
+`requirements.txt` is committed alongside `pyproject.toml` specifically for this: Community Cloud installs from `requirements.txt`/`pyproject.toml` itself, but reads a bare `pyproject.toml` as Poetry format, which this project's (uv/PEP 621) isn't — so it needs the plain `requirements.txt` instead. Regenerate it after changing dependencies with:
+
+```
+uv export --format requirements-txt --no-dev --no-hashes > requirements.txt
+```
+
+Community Cloud's free tier has modest CPU/RAM, so processing a clip there will likely be slower than the ~15-30s seen locally — the 60s clip-length cap in `app.py` helps keep any one request bounded. Frames wider than `analysis.MAX_FRAME_WIDTH` (960px) are downscaled before processing, and the app shows live per-frame progress (`Analyzing... frame 45/131`) rather than a silent spinner — both matter more on Cloud's slower CPU, where a multi-minute silent wait can look identical to a hang, and a long-idle connection with no traffic can also trip an idle timeout on the hosting proxy.
+
+`packages.txt` installs `libgl1` (an apt package, before the Python deps) — without it, `import cv2` fails on Cloud with `ImportError: libGL.so.1: cannot open shared object file`, because mediapipe pins the GUI build of opencv-contrib-python (not the "headless" one) regardless of the platform, and Cloud's base image doesn't ship the graphics library that GUI build links against. This box's own libGL happened to already be present, which is why the same code ran here without needing this file.
+
 ## Multi-view (side & front)
 
 `analyze_video()` and `compare_views()` in `analysis.py` work on a video from any camera angle — MediaPipe assigns landmarks by the subject's own anatomical left/right, not by where the camera is standing. Drop a `qb-throw-side.mp4` and/or `qb-throw-front.mp4` of the same throwing session next to `qb-throw.mp4` and re-run the "Multi-View Comparison" cell in the notebook to overlay all views (each aligned to its own detected release).
 
 This isn't true synchronized 3D triangulation — that needs calibrated, timestamp-aligned cameras filming the same instant — but it does let you sanity-check whether independent single-view measurements roughly agree, since a 2D-plane joint angle or speed estimate can be distorted by which way the camera happens to be facing.
+
+Real example, back/side/front of the same throwing session (faces blurred with `analysis.blur_faces()` — see below):
+
+![Back, side, and front view of the same throw, faces blurred](examples/multiview-throw.gif)
+
+The three views' wrist-speed curves line up closely around release despite being independent measurements — a good sign. Hip-shoulder separation is noisier, particularly from the front view: at a near head-on camera angle, the transverse-plane angle used for that metric can spike/wrap around a singularity, a real limitation of measuring a 3D rotation from one 2D-derived angle rather than an artifact worth hiding:
+
+![Wrist speed and hip-shoulder separation, three real camera angles overlaid](examples/multiview-chart.png)
+
+### Blurring faces in output
+
+`analysis.blur_faces(canvas, pose_landmarks)` blurs the head region of a rendered frame — used above so this README could include a real clip of a minor without showing an identifiable face. It uses the face landmarks (nose/eyes/ears) pose detection already produces as the primary signal, since unlike a generic face detector these track the head reliably even turned to the side — plus an independent Haar-cascade pass as a backup, since a missed frame isn't an acceptable failure mode here. Not applied automatically; pass `blur_faces_in_output=True` to `render_annotated_video()` to enable it.
 
 ## Ball tracking (experimental)
 
@@ -65,4 +92,4 @@ It only reports a result when it finds a track that's internally consistent (rea
 uv run pytest
 ```
 
-Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`, `angle_between`, the ball detector on synthetic frames) plus integration tests that run the full pipeline against the bundled `qb-throw.mp4` and check it finds real release events, per-rep angles, and cross-rep consistency stats.
+Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`, `angle_between`, `_find_movement_onset`, the ball detector on synthetic frames) plus integration tests that run the full pipeline against the bundled `qb-throw.mp4` and check it finds real release events, per-rep angles, cross-rep consistency stats, and that progress callbacks fire.
