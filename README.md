@@ -59,6 +59,8 @@ uv export --format requirements-txt --no-dev --no-hashes > requirements.txt
 
 Community Cloud's free tier has modest CPU/RAM, so processing a clip there will likely be slower than the ~15-30s seen locally — the 60s clip-length cap in `app.py` helps keep any one request bounded.
 
+`packages.txt` installs `libgl1` (an apt package, before the Python deps) — without it, `import cv2` fails on Cloud with `ImportError: libGL.so.1: cannot open shared object file`, because mediapipe pins the GUI build of opencv-contrib-python (not the "headless" one) regardless of the platform, and Cloud's base image doesn't ship the graphics library that GUI build links against. This box's own libGL happened to already be present, which is why the same code ran here without needing this file.
+
 ## Multi-view (side & front)
 
 `analyze_video()` and `compare_views()` in `analysis.py` work on a video from any camera angle — MediaPipe assigns landmarks by the subject's own anatomical left/right, not by where the camera is standing. Drop a `qb-throw-side.mp4` and/or `qb-throw-front.mp4` of the same throwing session next to `qb-throw.mp4` and re-run the "Multi-View Comparison" cell in the notebook to overlay all views (each aligned to its own detected release).
