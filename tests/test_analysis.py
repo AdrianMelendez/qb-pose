@@ -3,10 +3,16 @@ import numpy as np
 import pytest
 
 from analysis import (
+    L_EAR,
+    L_EYE,
+    NOSE,
+    R_EAR,
+    R_EYE,
     _detect_ball_in_roi,
     _find_movement_onset,
     _target_size,
     angle_between,
+    blur_faces,
     find_peaks,
     smooth,
     transverse_angle,
@@ -120,6 +126,44 @@ def test_find_movement_onset_finds_end_of_idle_stretch():
 
     onset = _find_movement_onset(speed, release_idx, fps)
     assert 28 <= onset <= 32  # right around the idle->moving transition
+
+
+class _Landmark:
+    def __init__(self, x, y, visibility=1.0):
+        self.x, self.y, self.visibility = x, y, visibility
+
+
+def _face_landmarks(cx, cy, w, h, spread=0.03):
+    """Fake pose landmarks with a face cluster at normalized (cx, cy)."""
+    lm = [_Landmark(0, 0)] * 9
+    lm[NOSE] = _Landmark(cx, cy)
+    lm[L_EYE] = _Landmark(cx + spread, cy - spread)
+    lm[R_EYE] = _Landmark(cx - spread, cy - spread)
+    lm[L_EAR] = _Landmark(cx + spread * 2, cy)
+    lm[R_EAR] = _Landmark(cx - spread * 2, cy)
+    return lm
+
+
+def test_blur_faces_blurs_the_head_region_via_landmarks():
+    w, h = 300, 300
+    # A noisy/high-frequency image so blur is easy to detect via variance.
+    rng = np.random.default_rng(0)
+    canvas = rng.integers(0, 255, size=(h, w, 3), dtype=np.uint8)
+
+    landmarks = _face_landmarks(cx=0.5, cy=0.3, w=w, h=h)
+    before_var = canvas[60:120, 120:180].var()
+
+    blurred = blur_faces(canvas.copy(), landmarks)
+    after_var = blurred[60:120, 120:180].var()
+
+    assert after_var < before_var * 0.5  # substantially smoothed where the face was
+
+
+def test_blur_faces_no_landmarks_and_no_face_leaves_image_unchanged():
+    w, h = 200, 200
+    canvas = np.full((h, w, 3), 127, dtype=np.uint8)  # flat color, no face for the cascade to find
+    result = blur_faces(canvas.copy(), None)
+    np.testing.assert_array_equal(result, canvas)
 
 
 def test_find_movement_onset_ignores_a_brief_pause_mid_motion():

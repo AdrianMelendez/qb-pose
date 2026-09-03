@@ -32,6 +32,11 @@ R_WRIST = 16
 R_HIP, L_HIP = 24, 23
 R_ANKLE, L_ANKLE = 28, 27
 
+# Face landmark indices (BlazePose topology), used only for blur_faces().
+NOSE = 0
+L_EYE, R_EYE = 2, 5
+L_EAR, R_EAR = 7, 8
+
 # Real-world long axis of an NFL football (~11in), used only to size the
 # search for a ball-like blob - not for any speed/distance calculation.
 BALL_LONG_AXIS_M = 0.28
@@ -168,6 +173,62 @@ def visualize_qb_analysis(frame, detection_result):
         label = f"{angle:.1f} deg"
         text_origin = (p_elbow[0] + 15, p_elbow[1])
         cv2.putText(canvas, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
+    return canvas
+
+
+_face_cascade = None
+
+
+def _get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _face_cascade = cv2.CascadeClassifier(path)
+    return _face_cascade
+
+
+def blur_faces(canvas, pose_landmarks, margin=1.8):
+    """Blur the head region in place, e.g. before saving a clip as a public example.
+
+    Uses the face landmarks (nose/eyes/ears) already produced by pose
+    detection as the primary signal - unlike a generic face detector, these
+    track the head reliably even turned to the side or partly away from
+    the camera, since they're the same landmarks the rest of the analysis
+    already depends on. A Haar-cascade face detector also runs as a second,
+    independent pass, and blurs anything it finds too: this exists to
+    protect a real person's identity, so a frame the landmark heuristic
+    happens to miss is not an acceptable failure mode.
+
+    Not applied automatically anywhere in the pipeline - call it explicitly
+    (e.g. when producing a clip meant to be shared publicly).
+    """
+    h, w = canvas.shape[:2]
+    boxes = []
+
+    if pose_landmarks:
+        pts = [pose_landmarks[i] for i in (NOSE, L_EYE, R_EYE, L_EAR, R_EAR) if pose_landmarks[i].visibility > 0.3]
+        if pts:
+            cx = sum(lm.x for lm in pts) / len(pts) * w
+            cy = sum(lm.y for lm in pts) / len(pts) * h
+            ear_l, ear_r = pose_landmarks[L_EAR], pose_landmarks[R_EAR]
+            ear_dist = np.hypot((ear_l.x - ear_r.x) * w, (ear_l.y - ear_r.y) * h)
+            radius = max(ear_dist, w * 0.05) * margin
+            boxes.append((cx - radius, cy - radius, cx + radius, cy + radius))
+
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    for fx, fy, fw, fh in _get_face_cascade().detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30)):
+        pad = fw * 0.4
+        boxes.append((fx - pad, fy - pad, fx + fw + pad, fy + fh + pad))
+
+    for x0, y0, x1, y1 in boxes:
+        x0, y0 = int(max(0, x0)), int(max(0, y0))
+        x1, y1 = int(min(w, x1)), int(min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        roi = canvas[y0:y1, x0:x1]
+        k = max(15, (min(roi.shape[:2]) // 2) | 1)
+        canvas[y0:y1, x0:x1] = cv2.GaussianBlur(roi, (k, k), 0)
 
     return canvas
 
@@ -498,6 +559,7 @@ def render_annotated_video(
     flash_frames=6,
     web_safe=True,
     on_progress=None,
+    blur_faces_in_output=False,
 ):
     """Write an annotated video: skeleton + elbow angle + wrist speed +
     hip-shoulder separation + a brief RELEASE flash at each detected event.
@@ -509,6 +571,9 @@ def render_annotated_video(
     on_progress(frame_count, total_frames) is called after every frame, same
     as analyze_video - total_frames may be None if unreliable, and does not
     include the (fast) transcode step.
+
+    blur_faces_in_output applies blur_faces() to every frame - use it when
+    producing a clip meant to be shared publicly.
     """
     PoseLandmarker = mp.tasks.vision.PoseLandmarker
     options = _make_landmarker_options(model_path)
@@ -539,6 +604,8 @@ def render_annotated_video(
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             annotated = visualize_qb_analysis(frame, result)
+            if blur_faces_in_output:
+                blur_faces(annotated, result.pose_landmarks[0] if result.pose_landmarks else None)
             draw_metrics_hud(
                 annotated,
                 wrist_speed_mps=speed_by_frame.get(frame_count),

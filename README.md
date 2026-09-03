@@ -68,6 +68,18 @@ Community Cloud's free tier has modest CPU/RAM, so processing a clip there will 
 
 This isn't true synchronized 3D triangulation — that needs calibrated, timestamp-aligned cameras filming the same instant — but it does let you sanity-check whether independent single-view measurements roughly agree, since a 2D-plane joint angle or speed estimate can be distorted by which way the camera happens to be facing.
 
+Real example, back/side/front of the same throwing session (faces blurred with `analysis.blur_faces()` — see below):
+
+![Back, side, and front view of the same throw, faces blurred](examples/multiview-throw.gif)
+
+The three views' wrist-speed curves line up closely around release despite being independent measurements — a good sign. Hip-shoulder separation is noisier, particularly from the front view: at a near head-on camera angle, the transverse-plane angle used for that metric can spike/wrap around a singularity, a real limitation of measuring a 3D rotation from one 2D-derived angle rather than an artifact worth hiding:
+
+![Wrist speed and hip-shoulder separation, three real camera angles overlaid](examples/multiview-chart.png)
+
+### Blurring faces in output
+
+`analysis.blur_faces(canvas, pose_landmarks)` blurs the head region of a rendered frame — used above so this README could include a real clip of a minor without showing an identifiable face. It uses the face landmarks (nose/eyes/ears) pose detection already produces as the primary signal, since unlike a generic face detector these track the head reliably even turned to the side — plus an independent Haar-cascade pass as a backup, since a missed frame isn't an acceptable failure mode here. Not applied automatically; pass `blur_faces_in_output=True` to `render_annotated_video()` to enable it.
+
 ## Ball tracking (experimental)
 
 `track_ball_release()` tries to track the football itself for a short window after each detected release, instead of only reporting the throwing-hand speed. It's a lightweight classical-CV detector (frame differencing in a small region ahead of the hand), not a trained object detector, self-calibrated to real-world units from the thrower's own body (meters-per-pixel derived from a body segment's known real length vs. its pixel length in that frame — no physical reference object needed).
