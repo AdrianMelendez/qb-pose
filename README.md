@@ -47,6 +47,18 @@ The output video is transcoded to H.264 (`analysis.transcode_to_h264`, via the s
 
 This is a single-process, synchronous demo app: one upload is processed per request, in-process. It's fine for local/personal use as-is; a public multi-user deployment would want the analysis to run as a background job (e.g. a task queue) instead of blocking the web request, so one slow upload can't stall everyone else's.
 
+### Deploying it publicly (Streamlit Community Cloud)
+
+The fastest way to get a shareable URL is [Streamlit Community Cloud](https://share.streamlit.io) (free): sign in with GitHub, "Create app" → "Yup, I have an app", point it at this repo/branch and `app.py`, and deploy — it defaults to Python 3.12, matching this project, no extra config needed.
+
+`requirements.txt` is committed alongside `pyproject.toml` specifically for this: Community Cloud installs from `requirements.txt`/`pyproject.toml` itself, but reads a bare `pyproject.toml` as Poetry format, which this project's (uv/PEP 621) isn't — so it needs the plain `requirements.txt` instead. Regenerate it after changing dependencies with:
+
+```
+uv export --format requirements-txt --no-dev --no-hashes > requirements.txt
+```
+
+Community Cloud's free tier has modest CPU/RAM, so processing a clip there will likely be slower than the ~15-30s seen locally — the 60s clip-length cap in `app.py` helps keep any one request bounded.
+
 ## Multi-view (side & front)
 
 `analyze_video()` and `compare_views()` in `analysis.py` work on a video from any camera angle — MediaPipe assigns landmarks by the subject's own anatomical left/right, not by where the camera is standing. Drop a `qb-throw-side.mp4` and/or `qb-throw-front.mp4` of the same throwing session next to `qb-throw.mp4` and re-run the "Multi-View Comparison" cell in the notebook to overlay all views (each aligned to its own detected release).
