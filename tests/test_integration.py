@@ -5,6 +5,7 @@ import pytest
 from analysis import (
     MODEL_PATH_DEFAULT,
     analyze_video,
+    render_annotated_video,
     summarize_consistency,
     summarize_releases,
     track_ball_release,
@@ -31,6 +32,8 @@ def test_analyze_video_detects_releases():
         assert 0 <= event["elbow_angle_release_deg"] <= 180
         assert 0 <= event["trunk_lean_release_deg"] <= 180
         assert event["stride_length_m"] >= 0
+        assert event["time_to_release_ms"] > 0
+        assert event["movement_onset_time_s"] < event["time_s"]
 
 
 def test_analyze_video_rejects_unreadable_file(tmp_path):
@@ -55,6 +58,34 @@ def test_summarize_consistency_across_reps():
 def test_summarize_consistency_needs_at_least_two_events():
     assert summarize_consistency([{"speed_mps": 5.0}]) is None
     assert summarize_consistency([]) is None
+
+
+def test_analyze_video_reports_progress(tmp_path):
+    calls = []
+    analysis = analyze_video(
+        VIDEO_PATH, model_path=MODEL_PATH_DEFAULT, view="back", on_progress=lambda f, t: calls.append((f, t))
+    )
+    assert len(calls) > 0
+    frame_counts = [c[0] for c in calls]
+    assert frame_counts == sorted(frame_counts)  # strictly increasing frame_count
+    assert frame_counts[-1] == len(calls)
+    total_frames = calls[0][1]
+    assert total_frames is None or total_frames > 0
+
+
+def test_render_annotated_video_reports_progress(tmp_path):
+    analysis = analyze_video(VIDEO_PATH, model_path=MODEL_PATH_DEFAULT, view="back")
+    calls = []
+    output_path = str(tmp_path / "out.mp4")
+    render_annotated_video(
+        VIDEO_PATH,
+        output_path,
+        analysis,
+        model_path=MODEL_PATH_DEFAULT,
+        on_progress=lambda f, t: calls.append((f, t)),
+    )
+    assert len(calls) > 0
+    assert calls[-1][0] == len(calls)
 
 
 def test_track_ball_release_only_reports_confident_tracks():

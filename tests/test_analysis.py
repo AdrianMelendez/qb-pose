@@ -2,7 +2,15 @@ import cv2
 import numpy as np
 import pytest
 
-from analysis import _detect_ball_in_roi, angle_between, find_peaks, smooth, transverse_angle
+from analysis import (
+    _detect_ball_in_roi,
+    _find_movement_onset,
+    _target_size,
+    angle_between,
+    find_peaks,
+    smooth,
+    transverse_angle,
+)
 
 
 def test_smooth_preserves_length():
@@ -89,3 +97,42 @@ def test_detect_ball_in_roi_no_motion_returns_none():
     frame = np.zeros((200, 200), dtype=np.uint8)
     cv2.circle(frame, (50, 50), 8, 255, -1)
     assert _detect_ball_in_roi(frame, frame, (0, 0, 200, 200)) is None
+
+
+@pytest.mark.parametrize(
+    "width, height, max_width, expected",
+    [
+        (640, 360, 960, (640, 360)),  # already under the cap - unchanged
+        (960, 540, 960, (960, 540)),  # exactly at the cap - unchanged
+        (1920, 1080, 960, (960, 540)),  # downscaled, aspect ratio preserved
+    ],
+)
+def test_target_size(width, height, max_width, expected):
+    assert _target_size(width, height, max_width) == expected
+
+
+def test_find_movement_onset_finds_end_of_idle_stretch():
+    fps = 30
+    idle = np.full(30, 0.2)  # 1s at rest
+    ramp = np.linspace(0.2, 5.0, 20)  # ramps up into the release
+    speed = np.concatenate([idle, ramp])
+    release_idx = len(speed) - 1
+
+    onset = _find_movement_onset(speed, release_idx, fps)
+    assert 28 <= onset <= 32  # right around the idle->moving transition
+
+
+def test_find_movement_onset_ignores_a_brief_pause_mid_motion():
+    fps = 30
+    idle = np.full(30, 0.2)  # true rest
+    windup = np.linspace(0.2, 3.0, 15)  # winding up
+    pause = np.full(5, 0.5)  # a brief pause mid-motion - still well above true rest
+    release = np.linspace(0.5, 5.0, 10)
+    speed = np.concatenate([idle, windup, pause, release])
+    release_idx = len(speed) - 1
+
+    onset = _find_movement_onset(speed, release_idx, fps)
+    # Onset should land at the end of the *true* idle stretch (~30), not the
+    # brief mid-motion pause (~50) - that's the whole point of using a
+    # clip-wide baseline instead of a threshold relative to this throw's peak.
+    assert onset < 40

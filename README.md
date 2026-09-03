@@ -7,6 +7,7 @@ It detects a 33-point body skeleton on an image or video of a QB throwing and co
 - **Elbow angle** at the throwing arm, drawn live on every frame, plus specifically at release and at "max cocking" (approximated as the pause in wrist speed right before the forward swing)
 - **Wrist speed** — throwing-hand speed over time (a proxy for release speed, not ball speed)
 - **Release time(s)** — detected as the peak(s) in wrist speed; a clip can contain several throwing reps
+- **Time to release** — duration from when the throwing motion first starts (the end of the last sustained near-idle stretch in wrist speed before release) to release itself
 - **Hip-shoulder separation** — rotational lead of the hips over the shoulders, a proxy for throwing efficiency
 - **Trunk lean** and **stride length** (peak foot separation) around release
 - **Consistency across reps** — mean/stddev/CV% of the above across every detected release in a clip, not just one throw's numbers
@@ -57,7 +58,7 @@ The fastest way to get a shareable URL is [Streamlit Community Cloud](https://sh
 uv export --format requirements-txt --no-dev --no-hashes > requirements.txt
 ```
 
-Community Cloud's free tier has modest CPU/RAM, so processing a clip there will likely be slower than the ~15-30s seen locally — the 60s clip-length cap in `app.py` helps keep any one request bounded.
+Community Cloud's free tier has modest CPU/RAM, so processing a clip there will likely be slower than the ~15-30s seen locally — the 60s clip-length cap in `app.py` helps keep any one request bounded. Frames wider than `analysis.MAX_FRAME_WIDTH` (960px) are downscaled before processing, and the app shows live per-frame progress (`Analyzing... frame 45/131`) rather than a silent spinner — both matter more on Cloud's slower CPU, where a multi-minute silent wait can look identical to a hang, and a long-idle connection with no traffic can also trip an idle timeout on the hosting proxy.
 
 `packages.txt` installs `libgl1` (an apt package, before the Python deps) — without it, `import cv2` fails on Cloud with `ImportError: libGL.so.1: cannot open shared object file`, because mediapipe pins the GUI build of opencv-contrib-python (not the "headless" one) regardless of the platform, and Cloud's base image doesn't ship the graphics library that GUI build links against. This box's own libGL happened to already be present, which is why the same code ran here without needing this file.
 
@@ -79,4 +80,4 @@ It only reports a result when it finds a track that's internally consistent (rea
 uv run pytest
 ```
 
-Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`, `angle_between`, the ball detector on synthetic frames) plus integration tests that run the full pipeline against the bundled `qb-throw.mp4` and check it finds real release events, per-rep angles, and cross-rep consistency stats.
+Covers the pure numeric helpers (`smooth`, `transverse_angle`, `find_peaks`, `angle_between`, `_find_movement_onset`, the ball detector on synthetic frames) plus integration tests that run the full pipeline against the bundled `qb-throw.mp4` and check it finds real release events, per-rep angles, cross-rep consistency stats, and that progress callbacks fire.

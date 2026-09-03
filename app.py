@@ -4,6 +4,7 @@ Run with: uv run streamlit run app.py
 """
 
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -41,17 +42,29 @@ def _probe_duration_s(video_path):
 
 
 @st.cache_data(show_spinner=False)
-def run_analysis(video_bytes: bytes, view: str):
+def run_analysis(video_bytes: bytes, view: str, _on_progress=None):
     """Analyze one uploaded clip and render its annotated video.
 
-    Cached on the raw upload bytes + view label, so re-running the app (any
-    widget interaction re-runs the whole script) doesn't reprocess an
-    unchanged upload.
+    Cached on the raw upload bytes + view label (the leading underscore on
+    _on_progress excludes it from Streamlit's cache key, since a callback
+    isn't meaningfully hashable), so re-running the app (any widget
+    interaction re-runs the whole script) doesn't reprocess an unchanged upload.
+
+    _on_progress(stage, frame_count, total_frames), if given, is called
+    throughout - stage is "analyzing" or "rendering" - so a caller can show
+    real progress instead of a silent multi-second/minute wait. That matters
+    beyond UX: a long-idle connection with no traffic back to the browser
+    can trip an idle timeout on some hosting proxies.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_bytes)
         video_path = tmp.name
     output_path = video_path + ".annotated.mp4"
+
+    def progress(stage):
+        if _on_progress is None:
+            return None
+        return lambda frame_count, total_frames: _on_progress(stage, frame_count, total_frames)
 
     try:
         duration_s = _probe_duration_s(video_path)
@@ -60,11 +73,13 @@ def run_analysis(video_bytes: bytes, view: str):
                 f"Clip is {duration_s:.0f}s, longer than the {MAX_DURATION_S}s limit for this demo."
             )
 
-        analysis = analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view=view)
+        analysis = analyze_video(video_path, model_path=MODEL_PATH_DEFAULT, view=view, on_progress=progress("analyzing"))
         events = summarize_releases(analysis)
         consistency = summarize_consistency(events)
         ball_releases = track_ball_release(video_path, analysis, model_path=MODEL_PATH_DEFAULT)
-        render_annotated_video(video_path, output_path, analysis, model_path=MODEL_PATH_DEFAULT)
+        render_annotated_video(
+            video_path, output_path, analysis, model_path=MODEL_PATH_DEFAULT, on_progress=progress("rendering")
+        )
         annotated_bytes = Path(output_path).read_bytes()
         return analysis, events, consistency, ball_releases, annotated_bytes
     finally:
@@ -83,17 +98,37 @@ if back_file is None:
     st.info("Upload at least a back-view clip to get started.")
     st.stop()
 
+STAGE_LABELS = {"analyzing": "Analyzing", "rendering": "Rendering annotated video"}
+
 uploads = {"back": back_file, "side": side_file, "front": front_file}
 results = {}
 
 for view, uploaded in uploads.items():
     if uploaded is None:
         continue
-    with st.spinner(f"Analyzing {view} view... this can take up to a minute for longer clips."):
-        try:
-            results[view] = run_analysis(uploaded.getvalue(), view)
-        except ValueError as e:
-            st.error(f"{view.capitalize()} view: {e}")
+
+    status = st.empty()
+    status.text(f"{view.capitalize()} view: starting...")
+    last_update = [0.0]
+
+    def on_progress(stage, frame_count, total_frames, _status=status, _view=view, _last=last_update):
+        # Throttled so this doesn't flood Streamlit with reruns - but it does
+        # update periodically regardless of clip length, which also keeps
+        # traffic flowing back to the browser during a long, otherwise-silent run.
+        now = time.time()
+        if now - _last[0] < 0.2:
+            return
+        _last[0] = now
+        label = STAGE_LABELS.get(stage, stage)
+        progress = f"frame {frame_count}/{total_frames}" if total_frames else f"frame {frame_count}"
+        _status.text(f"{_view.capitalize()} view: {label}... {progress}")
+
+    try:
+        results[view] = run_analysis(uploaded.getvalue(), view, _on_progress=on_progress)
+        status.empty()
+    except ValueError as e:
+        status.empty()
+        st.error(f"{view.capitalize()} view: {e}")
 
 if not results:
     st.stop()
@@ -104,6 +139,7 @@ CONSISTENCY_LABELS = {
     "elbow_angle_release_deg": "Elbow angle @release (deg)",
     "trunk_lean_release_deg": "Trunk lean @release (deg)",
     "stride_length_m": "Stride length (m)",
+    "time_to_release_ms": "Time to release (ms)",
 }
 
 for view, (analysis, events, consistency, ball_releases, annotated_bytes) in results.items():
@@ -115,6 +151,7 @@ for view, (analysis, events, consistency, ball_releases, annotated_bytes) in res
             [
                 {
                     "Time (s)": f"{e['time_s']:.2f}",
+                    "Time to release": f"{e['time_to_release_ms']:.0f} ms",
                     "Release speed": f"{e['speed_mps']:.2f} m/s ({e['speed_mph']:.1f} mph)",
                     "Peak hip-shoulder sep.": f"{e['peak_separation_deg']:.1f} deg",
                     "Elbow @release": f"{e['elbow_angle_release_deg']:.1f} deg",
